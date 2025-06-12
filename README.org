@@ -1,0 +1,5 @@
+* Gopv
+
+Basic mpv IPC client library for Go.
+
+Currently, there are no wrapper functions that correspond to mpv commands. This is to lower the maintainance burden and keep things flexible.
