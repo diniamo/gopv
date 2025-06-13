@@ -8,13 +8,16 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+
+	"go.pennock.tech/swallowjson"
 )
 
 type ipcResponse struct {
 	Error string `json:"error"`
 	Data any `json:"data"`
-	Event string `json:"event"`
 	RequestID int `json:"request_id"`
+	Event string `json:"event"`
+	EventData map[string]any `json:"-"`
 }
 
 type ipcRequest struct {
@@ -30,6 +33,7 @@ type Client struct {
 	mu sync.Mutex
 	receiver chan *ipcRequest
 	requests map[int]*ipcRequest
+	listeners map[string]func(map[string]any)
 	onError func(error)
 	// Initially set to true, since this this is for avoiding sending to a closed channel
 	// At the start, the channel is open, but callers may have to wait for the sent value to be actually consumed
@@ -83,6 +87,24 @@ func (c *Client) Request(command ...string) (any, error) {
 // Queues a synchronous IPC request.
 func (c *Client) RequestSync(command ...string) (any, error) {
 	return c.requestInternal(command, false)
+}
+
+// Registers an event listener. If the specified event already has one, it will be overridden.
+// The map data received by the listener function may be nil.
+// This function already handles enabling the event, so there is no need for another Request call.
+func (c *Client) Listen(event string, listener func(map[string]any)) error {
+	if c.listeners == nil {
+		c.listeners = make(map[string]func(map[string]any), 1)
+	} else if _, ok := c.listeners[event]; !ok {
+		_, err := c.Request("enable_event", event)
+		if err != nil {
+			return err
+		}
+	}
+
+	c.listeners[event] = listener
+
+	return nil
 }
 
 // Closes the IPC client. Subsequent requests will fail with ErrClosed.
@@ -140,7 +162,7 @@ func (c *Client) read() {
 		}
 
 		response := &ipcResponse{}
-		err = json.Unmarshal(data, response)
+		err = swallowjson.UnmarshalWith(response, "EventData", data)
 		if err != nil {
 			c.publishError(err)
 			continue
@@ -188,6 +210,11 @@ func (c *Client) dispatch(response *ipcResponse) {
 		request.responseChan <- response
 		close(request.responseChan)
 		delete(c.requests, response.RequestID)
+	} else {
+		listener, ok := c.listeners[response.Event]
+		if ok {
+			listener(response.EventData)
+		}
 	}
 }
 
