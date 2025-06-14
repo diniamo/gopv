@@ -118,7 +118,7 @@ func (c *Client) RequestJSON(requestRaw []byte) (any, error) {
 // The listener function is always run in a new goroutine.
 // The map data received by the listener function may be nil.
 // This function already handles enabling the event, so there is no need for another Request call.
-func (c *Client) Listen(event string, listener func(map[string]any)) error {
+func (c *Client) RegisterListener(event string, listener func(map[string]any)) error {
 	c.listenerMu.Lock()
 	defer c.listenerMu.Unlock()
 
@@ -136,14 +136,25 @@ func (c *Client) Listen(event string, listener func(map[string]any)) error {
 	return nil
 }
 
+// Unregisters the event listener associated with an event.
+// Attempts a disable_event request, but fails silently.
+func (c *Client) UnregisterListener(event string) {
+	c.listenerMu.Lock()
+	delete(c.listeners, event)
+	c.listenerMu.Unlock()
+
+	go c.Request("disable_event", event)
+}
+
 // Starts observing a property.
 // The observer function is always run in a new goroutine.
-func (c *Client) ObserveProperty(property string, observer func(any)) error {
+// The returned integer is the observation id, which can be passed to UnobserveProperty later.
+func (c *Client) ObserveProperty(property string, observer func(any)) (int, error) {
 	id := rand.Int()
 	
 	_, err := c.Request("observe_property", id, property)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	c.observerMu.Lock()
@@ -154,7 +165,17 @@ func (c *Client) ObserveProperty(property string, observer func(any)) error {
 	c.observers[id] = observer
 	c.observerMu.Unlock()
 
-	return nil
+	return id, err
+}
+
+// Removes the observer associated with a property.
+// Attempts an unobserve_property request, but fails silently.
+func (c *Client) UnobserveProperty(id int) {
+	c.observerMu.Lock()
+	delete(c.observers, id)
+	c.observerMu.Unlock()
+
+	go c.Request("unobserve_property", id)
 }
 
 // Closes the IPC client. Subsequent requests will fail with ErrClosed.
