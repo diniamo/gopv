@@ -114,6 +114,7 @@ func (c *Client) RequestJSON(requestRaw []byte) (any, error) {
 }
 
 // Registers an event listener. If the specified event already has one, it will be overridden.
+// The listener function is always run in a new goroutine.
 // The map data received by the listener function may be nil.
 // This function already handles enabling the event, so there is no need for another Request call.
 func (c *Client) Listen(event string, listener func(map[string]any)) error {
@@ -135,6 +136,7 @@ func (c *Client) Listen(event string, listener func(map[string]any)) error {
 }
 
 // Starts observing a property.
+// The observer function is always run in a new goroutine.
 func (c *Client) ObserveProperty(property string, observer func(any)) error {
 	id := rand.Int()
 	
@@ -277,7 +279,7 @@ func (c *Client) dispatch(response *ipcResponse) {
 		id := int(response.EventData["id"].(float64))
 		observer, ok := c.observers[id]
 		if ok {
-			observer(response.Data)
+			go observer(response.Data)
 		}
 	default:
 		c.listenerMu.Lock()
@@ -289,7 +291,7 @@ func (c *Client) dispatch(response *ipcResponse) {
 
 		listener, ok := c.listeners[response.Event]
 		if ok {
-			listener(response.EventData)
+			go listener(response.EventData)
 		}
 	}
 }
