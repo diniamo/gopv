@@ -29,12 +29,18 @@ type ipcRequest struct {
 
 // Represents an IPC client. Cannot be copied.
 type Client struct {
-	socket net.Conn
-	mu sync.Mutex
 	receiver chan *ipcRequest
+	socket net.Conn
+	
+	requestMu sync.Mutex
 	requests map[int]*ipcRequest
+
+	listenerMu sync.Mutex
 	listeners map[string]func(map[string]any)
+
+	observerMu sync.Mutex
 	observers map[int]func(any)
+	
 	onError func(error)
 	// Initially set to true, since this this is for avoiding sending to a closed channel
 	// At the start, the channel is open, but callers may have to wait for the sent value to be actually consumed
@@ -63,9 +69,11 @@ func Connect(path string, onError func(error)) (*Client, error) {
 	}
 
 	ipc := &Client{
-		socket: socket,
-		mu: sync.Mutex{},
 		receiver: make(chan *ipcRequest),
+		socket: socket,
+		requestMu: sync.Mutex{},
+		listenerMu: sync.Mutex{},
+		observerMu: sync.Mutex{},
 		onError: onError,
 		closed: false,
 	}
@@ -109,6 +117,9 @@ func (c *Client) RequestJSON(requestRaw []byte) (any, error) {
 // The map data received by the listener function may be nil.
 // This function already handles enabling the event, so there is no need for another Request call.
 func (c *Client) Listen(event string, listener func(map[string]any)) error {
+	c.listenerMu.Lock()
+	defer c.listenerMu.Unlock()
+
 	if c.listeners == nil {
 		c.listeners = make(map[string]func(map[string]any), 1)
 	} else if _, ok := c.listeners[event]; !ok {
@@ -132,10 +143,13 @@ func (c *Client) ObserveProperty(property string, observer func(any)) error {
 		return err
 	}
 
+	c.observerMu.Lock()
 	if c.observers == nil {
 		c.observers = make(map[int]func(any), 1)
 	}
+	
 	c.observers[id] = observer
+	c.observerMu.Unlock()
 
 	return nil
 }
@@ -161,9 +175,13 @@ func (c *Client) write() {
 			continue
 		}
 
-		c.mu.Lock()
+		c.requestMu.Lock()
+		if c.requests == nil {
+			c.requests = make(map[int]*ipcRequest, 1)
+		}
+		
 		c.requests[req.RequestID] = req
-		c.mu.Unlock()
+		c.requestMu.Unlock()
 
 		// Realistically, this can never fail because the pipe has been closed,
 		// since the read loop should immediately exit, and close the request channel.
@@ -210,10 +228,6 @@ func (c *Client) requestSend(request *ipcRequest) (any, error) {
 		return nil, ErrClosed
 	}
 
-	if c.requests == nil {
-		c.requests = make(map[int]*ipcRequest, 1)
-	}
-
 	c.receiver <- request
 	response := <-request.responseChan
 	if response.Error != "success" {
@@ -237,9 +251,13 @@ func (c *Client) requestInternal(command []any, async bool) (any, error) {
 func (c *Client) dispatch(response *ipcResponse) {
 	switch response.Event {
 	case "":
-		c.mu.Lock()
-		defer c.mu.Unlock()
+		c.requestMu.Lock()
+		defer c.requestMu.Unlock()
 	
+		if c.requests == nil {
+			return
+		}
+		
 		request, ok := c.requests[response.RequestID]
 		if !ok {
 			return
@@ -249,12 +267,26 @@ func (c *Client) dispatch(response *ipcResponse) {
 		close(request.responseChan)
 		delete(c.requests, response.RequestID)
 	case "property-change":
+		c.observerMu.Lock()
+		defer c.observerMu.Unlock()
+		
+		if c.observers == nil {
+			return
+		}
+
 		id := int(response.EventData["id"].(float64))
 		observer, ok := c.observers[id]
 		if ok {
 			observer(response.Data)
 		}
 	default:
+		c.listenerMu.Lock()
+		defer c.listenerMu.Unlock()
+
+		if c.listeners == nil {
+			return
+		}
+
 		listener, ok := c.listeners[response.Event]
 		if ok {
 			listener(response.EventData)
