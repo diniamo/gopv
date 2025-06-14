@@ -34,6 +34,7 @@ type Client struct {
 	receiver chan *ipcRequest
 	requests map[int]*ipcRequest
 	listeners map[string]func(map[string]any)
+	observers map[int]func(any)
 	onError func(error)
 	// Initially set to true, since this this is for avoiding sending to a closed channel
 	// At the start, the channel is open, but callers may have to wait for the sent value to be actually consumed
@@ -103,6 +104,23 @@ func (c *Client) Listen(event string, listener func(map[string]any)) error {
 	}
 
 	c.listeners[event] = listener
+
+	return nil
+}
+
+// Starts observing a property.
+func (c *Client) ObserveProperty(property string, observer func(any)) error {
+	id := rand.Int()
+	
+	_, err := c.Request("observe_property", id, property)
+	if err != nil {
+		return err
+	}
+
+	if c.observers == nil {
+		c.observers = make(map[int]func(any), 1)
+	}
+	c.observers[id] = observer
 
 	return nil
 }
@@ -198,7 +216,8 @@ func (c *Client) requestInternal(command []any, async bool) (any, error) {
 }
 
 func (c *Client) dispatch(response *ipcResponse) {
-	if response.Event == "" {
+	switch response.Event {
+	case "":
 		c.mu.Lock()
 		defer c.mu.Unlock()
 	
@@ -210,7 +229,13 @@ func (c *Client) dispatch(response *ipcResponse) {
 		request.responseChan <- response
 		close(request.responseChan)
 		delete(c.requests, response.RequestID)
-	} else {
+	case "property-change":
+		id := int(response.EventData["id"].(float64))
+		observer, ok := c.observers[id]
+		if ok {
+			observer(response.Data)
+		}
+	default:
 		listener, ok := c.listeners[response.Event]
 		if ok {
 			listener(response.EventData)
