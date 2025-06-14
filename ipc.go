@@ -90,6 +90,21 @@ func (c *Client) RequestSync(command ...any) (any, error) {
 	return c.requestInternal(command, false)
 }
 
+// Queues a request parsed from JSON.
+// A custom request id is added before the request is sent.
+func (c *Client) RequestJSON(requestRaw []byte) (any, error) {
+	request := &ipcRequest{}
+	err := json.Unmarshal(requestRaw, request)
+	if err != nil {
+		return nil, err
+	}
+
+	request.RequestID = rand.Int()
+	request.responseChan = make(chan *ipcResponse, 1)
+
+	return c.requestSend(request)
+}
+
 // Registers an event listener. If the specified event already has one, it will be overridden.
 // The map data received by the listener function may be nil.
 // This function already handles enabling the event, so there is no need for another Request call.
@@ -190,20 +205,13 @@ func (c *Client) read() {
 	}
 }
 
-func (c *Client) requestInternal(command []any, async bool) (any, error) {
+func (c *Client) requestSend(request *ipcRequest) (any, error) {
 	if c.closed {
 		return nil, ErrClosed
 	}
 
 	if c.requests == nil {
 		c.requests = make(map[int]*ipcRequest, 1)
-	}
-
-	request := &ipcRequest{
-		Command: command,
-		RequestID: rand.Int(),
-		Async: async,
-		responseChan: make(chan *ipcResponse),
 	}
 
 	c.receiver <- request
@@ -213,6 +221,17 @@ func (c *Client) requestInternal(command []any, async bool) (any, error) {
 	}
 
 	return response.Data, nil	
+}
+
+func (c *Client) requestInternal(command []any, async bool) (any, error) {
+	request := &ipcRequest{
+		Command: command,
+		RequestID: rand.Int(),
+		Async: async,
+		responseChan: make(chan *ipcResponse),
+	}
+
+	return c.requestSend(request)
 }
 
 func (c *Client) dispatch(response *ipcResponse) {
