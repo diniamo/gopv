@@ -31,7 +31,7 @@ type ipcRequest struct {
 // Represents an IPC client. Cannot be copied.
 type Client struct {
 	receiver chan *ipcRequest
-	socket net.Conn
+	conn net.Conn
 	
 	requestMu sync.Mutex
 	requests map[int]*ipcRequest
@@ -61,17 +61,10 @@ func (e MpvError) Error() string {
 // (for example if mpv exits).
 var ErrClosed = errors.New("IPC client is closed")
 
-// Connects to an active mpv socket, and returns an IPC struct.
-// onError may be nil, in which case errors are silently ignored.
-func Connect(path string, onError func(error)) (*Client, error) {
-	socket, err := net.Dial("unix", path)
-	if err != nil {
-		return nil, err
-	}
-
-	ipc := &Client{
+func connectInternal(conn net.Conn, onError func(error)) *Client {
+	client := &Client{
 		receiver: make(chan *ipcRequest),
-		socket: socket,
+		conn: conn,
 		requestMu: sync.Mutex{},
 		listenerMu: sync.Mutex{},
 		observerMu: sync.Mutex{},
@@ -79,10 +72,10 @@ func Connect(path string, onError func(error)) (*Client, error) {
 		closed: false,
 	}
 
-	go ipc.write()
-	go ipc.read()
+	go client.write()
+	go client.read()
 
-	return ipc, nil
+	return client
 }
 
 // Queues an IPC request.
@@ -183,7 +176,7 @@ func (c *Client) Close() {
 	c.closed = true
 
 	close(c.receiver)
-	c.socket.Close()
+	c.conn.Close()
 }
 
 func (c *Client) write() {
@@ -209,12 +202,12 @@ func (c *Client) write() {
 
 		// Realistically, this can never fail because the pipe has been closed,
 		// since the read loop should immediately exit, and close the request channel.
-		_, err = c.socket.Write(body)
+		_, err = c.conn.Write(body)
 		if err != nil {
 			c.publishError(err)
 			continue
 		}
-		_, err = c.socket.Write([]byte{'\n'})
+		_, err = c.conn.Write([]byte{'\n'})
 		if err != nil {
 			c.publishError(err)
 			continue
@@ -223,7 +216,7 @@ func (c *Client) write() {
 }
 
 func (c *Client) read() {
-	reader := bufio.NewReader(c.socket)
+	reader := bufio.NewReader(c.conn)
 	for {
 		data, err := reader.ReadBytes('\n')
 		if err != nil {

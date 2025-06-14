@@ -1,2 +1,6 @@
+github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
+github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 go.pennock.tech/swallowjson v1.0.2 h1:vkefBIn8GOFMLiLMNU8fEhWAAgiXXtsxsnqqcP7Kszg=
 go.pennock.tech/swallowjson v1.0.2/go.mod h1:b6sGbYY+XjsKddYrRT44EJQi6BJCQwW+biJzIONU2xw=
+golang.org/x/sys v0.10.0 h1:SqMFp9UcQJZa+pmYuAKjd9xq1f0j5rLcDIk0mj4qAsA=
+golang.org/x/sys v0.10.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
