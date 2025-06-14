@@ -18,6 +18,7 @@ type ipcResponse struct {
 	RequestID int `json:"request_id"`
 	Event string `json:"event"`
 	EventData map[string]any `json:"-"`
+	ID int `json:"id"`
 }
 
 type ipcRequest struct {
@@ -276,8 +277,7 @@ func (c *Client) dispatch(response *ipcResponse) {
 			return
 		}
 
-		id := int(response.EventData["id"].(float64))
-		observer, ok := c.observers[id]
+		observer, ok := c.observers[response.ID]
 		if ok {
 			go observer(response.Data)
 		}
