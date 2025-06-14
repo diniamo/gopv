@@ -21,7 +21,7 @@ type ipcResponse struct {
 }
 
 type ipcRequest struct {
-	Command []string `json:"command"`
+	Command []any `json:"command"`
 	RequestID int `json:"request_id"`
 	Async bool `json:"async"`
 	responseChan chan *ipcResponse
@@ -80,12 +80,12 @@ func Connect(path string, onError func(error)) (*Client, error) {
 // to keep mpv smooth for the user. Asynchronous only refers to how mpv handles the request,
 // so the caller is still blocked until mpv returns a response.
 // Use RequestSync, if a synchronous request is desired.
-func (c *Client) Request(command ...string) (any, error) {
+func (c *Client) Request(command ...any) (any, error) {
 	return c.requestInternal(command, true)
 }
 
 // Queues a synchronous IPC request.
-func (c *Client) RequestSync(command ...string) (any, error) {
+func (c *Client) RequestSync(command ...any) (any, error) {
 	return c.requestInternal(command, false)
 }
 
@@ -172,7 +172,7 @@ func (c *Client) read() {
 	}
 }
 
-func (c *Client) requestInternal(command []string, async bool) (any, error) {
+func (c *Client) requestInternal(command []any, async bool) (any, error) {
 	if c.closed {
 		return nil, ErrClosed
 	}
