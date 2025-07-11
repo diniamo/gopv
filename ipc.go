@@ -110,33 +110,20 @@ func (c *Client) RequestJSON(requestRaw []byte) (any, error) {
 // Registers an event listener. If the specified event already has one, it will be overridden.
 // The listener function is always run in a new goroutine.
 // The map data received by the listener function may be nil.
-// This function already handles enabling the event, so there is no need for another Request call.
-func (c *Client) RegisterListener(event string, listener func(map[string]any)) error {
+func (c *Client) RegisterListener(event string, listener func(map[string]any)) {
 	c.listenerMu.Lock()
-	defer c.listenerMu.Unlock()
-
 	if c.listeners == nil {
 		c.listeners = make(map[string]func(map[string]any), 1)
-	} else if _, ok := c.listeners[event]; !ok {
-		_, err := c.Request("enable_event", event)
-		if err != nil {
-			return err
-		}
 	}
-
 	c.listeners[event] = listener
-
-	return nil
+	c.listenerMu.Unlock()
 }
 
-// Unregisters the event listener associated with an event.
-// Attempts a disable_event request, but fails silently.
+// Unregisters the event listener associated with an ID.
 func (c *Client) UnregisterListener(event string) {
 	c.listenerMu.Lock()
 	delete(c.listeners, event)
 	c.listenerMu.Unlock()
-
-	go c.Request("disable_event", event)
 }
 
 // Starts observing a property.
@@ -161,7 +148,7 @@ func (c *Client) ObserveProperty(property string, observer func(any)) (int, erro
 	return id, err
 }
 
-// Removes the observer associated with a property.
+// Removes the observer associated with an ID.
 // Attempts an unobserve_property request, but fails silently.
 func (c *Client) UnobserveProperty(id int) {
 	c.observerMu.Lock()
