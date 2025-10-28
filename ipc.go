@@ -32,7 +32,7 @@ type ipcRequest struct {
 type Client struct {
 	receiver chan *ipcRequest
 	conn net.Conn
-	
+
 	requestMu sync.Mutex
 	requests map[int]*ipcRequest
 
@@ -41,7 +41,7 @@ type Client struct {
 
 	observerMu sync.Mutex
 	observers map[int]func(any)
-	
+
 	onError func(error)
 	// Initially set to true, since this this is for avoiding sending to a closed channel
 	// At the start, the channel is open, but callers may have to wait for the sent value to be actually consumed
@@ -131,19 +131,20 @@ func (c *Client) UnregisterListener(event string) {
 // The returned integer is the observation id, which can be passed to UnobserveProperty later.
 func (c *Client) ObserveProperty(property string, observer func(any)) (int, error) {
 	id := rand.Int()
-	
-	_, err := c.Request("observe_property", id, property)
-	if err != nil {
-		return 0, err
-	}
 
 	c.observerMu.Lock()
 	if c.observers == nil {
 		c.observers = make(map[int]func(any), 1)
 	}
-	
+
 	c.observers[id] = observer
 	c.observerMu.Unlock()
+
+	_, err := c.Request("observe_property", id, property)
+	if err != nil {
+		delete(c.observers, id)
+		return 0, err
+	}
 
 	return id, err
 }
@@ -172,7 +173,7 @@ func (c *Client) write() {
 		if !ok {
 			return
 		}
-		
+
 		body, err := json.Marshal(req)
 		if err != nil {
 			c.publishError(err)
@@ -183,7 +184,7 @@ func (c *Client) write() {
 		if c.requests == nil {
 			c.requests = make(map[int]*ipcRequest, 1)
 		}
-		
+
 		c.requests[req.RequestID] = req
 		c.requestMu.Unlock()
 
@@ -238,7 +239,7 @@ func (c *Client) requestSend(request *ipcRequest) (any, error) {
 		return nil, &MpvError{response.Error}
 	}
 
-	return response.Data, nil	
+	return response.Data, nil
 }
 
 func (c *Client) requestInternal(command []any, async bool) (any, error) {
@@ -257,11 +258,11 @@ func (c *Client) dispatch(response *ipcResponse) {
 	case "":
 		c.requestMu.Lock()
 		defer c.requestMu.Unlock()
-	
+
 		if c.requests == nil {
 			return
 		}
-		
+
 		request, ok := c.requests[response.RequestID]
 		if !ok {
 			return
@@ -273,7 +274,7 @@ func (c *Client) dispatch(response *ipcResponse) {
 	case "property-change":
 		c.observerMu.Lock()
 		defer c.observerMu.Unlock()
-		
+
 		if c.observers == nil {
 			return
 		}
