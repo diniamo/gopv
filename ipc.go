@@ -13,39 +13,39 @@ import (
 )
 
 type ipcResponse struct {
-	Error string `json:"error"`
-	Data any `json:"data"`
-	RequestID int `json:"request_id"`
-	Event string `json:"event"`
+	Error     string         `json:"error"`
+	Data      any            `json:"data"`
+	RequestID int            `json:"request_id"`
+	Event     string         `json:"event"`
 	EventData map[string]any `json:"-"`
-	ID int `json:"id"`
+	ID        int            `json:"id"`
 }
 
 type ipcRequest struct {
-	Command []any `json:"command"`
-	RequestID int `json:"request_id"`
-	Async bool `json:"async"`
+	Command      []any `json:"command"`
+	RequestID    int   `json:"request_id"`
+	Async        bool  `json:"async"`
 	responseChan chan *ipcResponse
 }
 
 // Represents an IPC client. Cannot be copied.
 type Client struct {
-	receiver chan *ipcRequest
-	conn net.Conn
+	receiver   chan *ipcRequest
+	conn       net.Conn
 
-	requestMu sync.Mutex
-	requests map[int]*ipcRequest
+	requestMu  sync.Mutex
+	requests   map[int]*ipcRequest
 
 	listenerMu sync.Mutex
-	listeners map[string]func(map[string]any)
+	listeners  map[string]func(map[string]any)
 
 	observerMu sync.Mutex
-	observers map[int]func(any)
+	observers  map[int]func(any)
 
-	onError func(error)
+	onError    func(error)
 	// Initially set to true, since this this is for avoiding sending to a closed channel
 	// At the start, the channel is open, but callers may have to wait for the sent value to be actually consumed
-	closed bool
+	closed     bool
 }
 
 // Represents an error sent by mpv.
@@ -63,13 +63,13 @@ var ErrClosed = errors.New("IPC client is closed")
 
 func connectInternal(conn net.Conn, onError func(error)) *Client {
 	client := &Client{
-		receiver: make(chan *ipcRequest),
-		conn: conn,
-		requestMu: sync.Mutex{},
+		receiver:   make(chan *ipcRequest),
+		conn:       conn,
+		requestMu:  sync.Mutex{},
 		listenerMu: sync.Mutex{},
 		observerMu: sync.Mutex{},
-		onError: onError,
-		closed: false,
+		onError:    onError,
+		closed:     false,
 	}
 
 	go client.write()
@@ -101,7 +101,7 @@ func (c *Client) RequestJSON(requestRaw []byte) (any, error) {
 		return nil, err
 	}
 
-	request.RequestID = rand.Int()
+	request.RequestID    = rand.Int()
 	request.responseChan = make(chan *ipcResponse, 1)
 
 	return c.requestSend(request)
@@ -188,8 +188,6 @@ func (c *Client) write() {
 		c.requests[req.RequestID] = req
 		c.requestMu.Unlock()
 
-		// Realistically, this can never fail because the pipe has been closed,
-		// since the read loop should immediately exit, and close the request channel.
 		_, err = c.conn.Write(body)
 		if err != nil {
 			c.publishError(err)
@@ -244,9 +242,9 @@ func (c *Client) requestSend(request *ipcRequest) (any, error) {
 
 func (c *Client) requestInternal(command []any, async bool) (any, error) {
 	request := &ipcRequest{
-		Command: command,
-		RequestID: rand.Int(),
-		Async: async,
+		Command:      command,
+		RequestID:    rand.Int(),
+		Async:        async,
 		responseChan: make(chan *ipcResponse),
 	}
 
