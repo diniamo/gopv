@@ -18,7 +18,7 @@ func generatePath() string {
 	return "gopv-" + strconv.Itoa(os.Getpid())
 }
 
-func connect(path string, onError func(error)) (*Client, error) {
+func connect(path string) (*Client, error) {
 	handle, err := windows.CreateFile(
 		pwstr(path),
 		windows.GENERIC_READ | windows.GENERIC_WRITE,
@@ -49,10 +49,10 @@ func connect(path string, onError func(error)) (*Client, error) {
 		read:   windows.Overlapped{HEvent: read},
 		write:  windows.Overlapped{HEvent: write},
 	}
-	return connectInternal(conn, onError), nil
+	return connectInternal(conn), nil
 }
 
-func host(cmd *exec.Cmd, onError func(error)) (*Client, error) {
+func host(cmd *exec.Cmd) (*Client, error) {
 	// NOTE: pipe name
 	name   := `\\.\pipe\strim-ipc-` + strconv.FormatInt(time.Now().Unix(), 10)
 	pwname := pwstr(name)
@@ -140,7 +140,7 @@ func host(cmd *exec.Cmd, onError func(error)) (*Client, error) {
 		read:   windows.Overlapped{HEvent: event},
 		write:  windows.Overlapped{HEvent: write},
 	}
-	client := connectInternal(conn, onError)
+	client := connectInternal(conn)
 
 	return client, nil
 }

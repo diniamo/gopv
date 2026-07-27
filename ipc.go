@@ -2,302 +2,317 @@ package gopv
 
 import (
 	"bufio"
+	"container/list"
+	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"math/rand"
 	"net"
 	"sync"
 
 	"go.pennock.tech/swallowjson"
 )
 
-type ipcResponse struct {
-	Error     string         `json:"error"`
-	Data      any            `json:"data"`
-	RequestID int            `json:"request_id"`
-	Event     string         `json:"event"`
-	EventData map[string]any `json:"-"`
-	ID        int            `json:"id"`
+// IPC client
+type Client struct {
+	conn        net.Conn
+
+	requestChan chan request
+	requestMu   sync.Mutex
+	requests    map[int64]chan any
+	requestID   int64
+
+	listenerMu  sync.RWMutex
+	listeners   map[string]*list.List
+
+	observerMu  sync.RWMutex
+	observers   map[int64]chan<- any
+	observerID  int64
+
+	close       sync.Once
+	ctx         context.Context
+	cancel      func()
+}
+
+// Error sent by mpv
+type IPCError struct {
+	status string
+}
+func (e IPCError) Error() string {
+	return e.status
+}
+
+var ErrClosed = errors.New("IPC client is closed")
+
+// Send an IPC request.
+// Errors are also sent through the channel.
+func (c *Client) Request(command ...any) <-chan any {
+	// IMPORTANT: this has to be buffered, so we dispatcher goroutine won't hang, if the user ignores the result
+	responseChan := make(chan any, 1)
+
+	select {
+	case c.requestChan <- request{command, responseChan}:
+	case <-c.ctx.Done():
+		responseChan <- ErrClosed
+		close(responseChan)
+	}
+
+	return responseChan
+}
+
+// Subscribe to an event.
+// The map data sent through the channel may be nil.
+// The returned function can be used to unsubscribe and close the channel.
+func (c *Client) Subscribe(event string) (<-chan map[string]any, func(), error) {
+	if c.ctx.Err() != nil {
+		return nil, nil, ErrClosed
+	}
+
+	c.listenerMu.Lock()
+
+	var listeners *list.List
+	if c.listeners == nil {
+		c.listeners        = make(map[string]*list.List, 1)
+		listeners          = list.New()
+		c.listeners[event] = listeners
+	} else if c.listeners[event] == nil {
+		listeners          = list.New()
+		c.listeners[event] = listeners
+	}
+
+	listener := make(chan map[string]any)
+	element  := listeners.PushBack(chan<- map[string]any(listener))
+
+	c.listenerMu.Unlock()
+
+	return listener, func() {
+		c.listenerMu.Lock()
+
+		c.listeners[event].Remove(element)
+		close(listener)
+
+		c.listenerMu.Unlock()
+	}, nil
+}
+
+// Start observing a property.
+// The returned function can be used to stop observing and close the channel.
+func (c *Client) ObserveProperty(property string) (<-chan any, func(), error) {
+	c.observerMu.Lock()
+
+	if c.observers == nil {
+		c.observers = make(map[int64]chan<- any, 1)
+	}
+
+	id := c.observerID
+	observer := make(chan any)
+	c.observers[id] = observer
+	c.observerID += 1
+
+	c.observerMu.Unlock()
+
+	response := <-c.Request("observe_property", id, property)
+	if err, ok := response.(error); ok {
+		c.observerMu.Lock()
+		delete(c.observers, id)
+		c.observerMu.Unlock()
+
+		return nil, nil, err
+	}
+
+	return observer, func() {
+		c.observerMu.Lock()
+
+		delete(c.observers, id)
+		close(observer)
+
+		c.observerMu.Unlock()
+	}, nil
+}
+
+// Close the client.
+func (c *Client) Close() {
+	c.close.Do(func() {
+		c.cancel()
+		c.conn.Close()
+
+		c.requestMu.Lock()
+		for _, ch := range c.requests {
+			close(ch)
+		}
+		clear(c.requests)
+		c.requestMu.Unlock()
+
+		c.listenerMu.Lock()
+		for _, listeners := range c.listeners {
+			for e := listeners.Front(); e != nil; e = e.Next() {
+				close(e.Value.(chan<- map[string]any))
+			}
+		}
+		clear(c.listeners)
+		c.listenerMu.Unlock()
+
+		c.observerMu.Lock()
+		for _, ch := range c.observers {
+			close(ch)
+		}
+		clear(c.observers)
+		c.observerMu.Unlock()
+	})
+}
+
+
+type request struct {
+	command      []any
+	responseChan chan any
 }
 
 type ipcRequest struct {
-	Command      []any `json:"command"`
-	RequestID    int   `json:"request_id"`
-	Async        bool  `json:"async"`
-	responseChan chan *ipcResponse
+	Command   []any `json:"command"`
+	RequestID int64 `json:"request_id"`
+	Async     bool  `json:"async"`
 }
 
-// Represents an IPC client. Cannot be copied.
-type Client struct {
-	receiver   chan *ipcRequest
-	conn       net.Conn
-
-	requestMu  sync.Mutex
-	requests   map[int]*ipcRequest
-
-	listenerMu sync.Mutex
-	listeners  map[string]func(map[string]any)
-
-	observerMu sync.Mutex
-	observers  map[int]func(any)
-
-	onError    func(error)
-	// Initially set to true, since this this is for avoiding sending to a closed channel
-	// At the start, the channel is open, but callers may have to wait for the sent value to be actually consumed
-	closed     bool
+type ipcResponse struct {
+	Error     string         `json:"error"`
+	Data      any            `json:"data"`
+	RequestID int64          `json:"request_id"`
+	Event     string         `json:"event"`
+	EventData map[string]any `json:"-"`
+	ID        int64          `json:"id"`
 }
 
-// Represents an error sent by mpv.
-type MpvError struct {
-	status string
-}
-func (e MpvError) Error() string {
-	return "mpv returned an error: " + e.status
-}
+func connectInternal(conn net.Conn) *Client {
+	ctx, cancel := context.WithCancel(context.Background())
 
-// Means that the IPC client is closed (so no requests can be sent).
-// Note that the client may be closed without the Close function being called
-// (for example if mpv exits).
-var ErrClosed = errors.New("IPC client is closed")
-
-func connectInternal(conn net.Conn, onError func(error)) *Client {
 	client := &Client{
-		receiver:   make(chan *ipcRequest),
-		conn:       conn,
-		requestMu:  sync.Mutex{},
-		listenerMu: sync.Mutex{},
-		observerMu: sync.Mutex{},
-		onError:    onError,
-		closed:     false,
+		conn:        conn,
+		requestChan: make(chan request),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 
-	go client.write()
-	go client.read()
+	go client.writeLoop()
+	go client.readLoop()
 
 	return client
 }
 
-// Queues an IPC request.
-// This is an asynchronous request, which should be the desired behavior most of the time,
-// to keep mpv smooth for the user. Asynchronous only refers to how mpv handles the request,
-// so the caller is still blocked until mpv returns a response.
-// Use RequestSync, if a synchronous request is desired.
-func (c *Client) Request(command ...any) (any, error) {
-	return c.requestInternal(command, true)
-}
-
-// Queues a synchronous IPC request.
-func (c *Client) RequestSync(command ...any) (any, error) {
-	return c.requestInternal(command, false)
-}
-
-// Queues a request parsed from JSON.
-// A custom request id is added before the request is sent.
-func (c *Client) RequestJSON(requestRaw []byte) (any, error) {
-	request := &ipcRequest{}
-	err := json.Unmarshal(requestRaw, request)
-	if err != nil {
-		return nil, err
-	}
-
-	request.RequestID    = rand.Int()
-	request.responseChan = make(chan *ipcResponse, 1)
-
-	return c.requestSend(request)
-}
-
-// Registers an event listener. If the specified event already has one, it will be overridden.
-// The listener function is always run in a new goroutine.
-// The map data received by the listener function may be nil.
-func (c *Client) RegisterListener(event string, listener func(map[string]any)) {
-	c.listenerMu.Lock()
-	if c.listeners == nil {
-		c.listeners = make(map[string]func(map[string]any), 1)
-	}
-	c.listeners[event] = listener
-	c.listenerMu.Unlock()
-}
-
-// Unregisters the event listener associated with an ID.
-func (c *Client) UnregisterListener(event string) {
-	c.listenerMu.Lock()
-	delete(c.listeners, event)
-	c.listenerMu.Unlock()
-}
-
-// Starts observing a property.
-// The observer function is always run in a new goroutine.
-// The returned integer is the observation id, which can be passed to UnobserveProperty later.
-func (c *Client) ObserveProperty(property string, observer func(any)) (int, error) {
-	id := rand.Int()
-
-	c.observerMu.Lock()
-	if c.observers == nil {
-		c.observers = make(map[int]func(any), 1)
-	}
-
-	c.observers[id] = observer
-	c.observerMu.Unlock()
-
-	_, err := c.Request("observe_property", id, property)
-	if err != nil {
-		delete(c.observers, id)
-		return 0, err
-	}
-
-	return id, err
-}
-
-// Removes the observer associated with an ID.
-// Attempts an unobserve_property request, but fails silently.
-func (c *Client) UnobserveProperty(id int) {
-	c.observerMu.Lock()
-	delete(c.observers, id)
-	c.observerMu.Unlock()
-
-	go c.Request("unobserve_property", id)
-}
-
-// Closes the IPC client. Subsequent requests will fail with ErrClosed.
-func (c *Client) Close() {
-	c.closed = true
-
-	close(c.receiver)
-	c.conn.Close()
-}
-
-func (c *Client) write() {
+func (c *Client) writeLoop() {
 	for {
-		req, ok := <-c.receiver
-		if !ok {
+		select {
+		case request := <-c.requestChan:
+			c.sendRequest(request)
+		case <-c.ctx.Done():
 			return
 		}
-
-		body, err := json.Marshal(req)
-		if err != nil {
-			c.publishError(err)
-			continue
-		}
-
-		c.requestMu.Lock()
-		if c.requests == nil {
-			c.requests = make(map[int]*ipcRequest, 1)
-		}
-
-		c.requests[req.RequestID] = req
-		c.requestMu.Unlock()
-
-		_, err = c.conn.Write(body)
-		if err != nil {
-			c.publishError(err)
-			continue
-		}
-		_, err = c.conn.Write([]byte{'\n'})
-		if err != nil {
-			c.publishError(err)
-			continue
-		}
 	}
 }
 
-func (c *Client) read() {
+func (c *Client) sendRequest(request request) {
+	c.requestMu.Lock()
+
+	id := c.requestID
+
+	body, err := json.Marshal(ipcRequest{
+		Command:   request.command,
+		RequestID: id,
+		Async:     true,
+	})
+	if err != nil {
+		c.requestMu.Unlock()
+		request.responseChan <- err
+		close(request.responseChan)
+		return
+	}
+
+	if c.requests == nil {
+		c.requests = make(map[int64]chan any, 1)
+	}
+	c.requests[id] = request.responseChan
+	c.requestID += 1
+
+	c.requestMu.Unlock()
+
+	_, err = c.conn.Write(append(body, '\n'))
+	if err != nil {
+		c.requestMu.Lock()
+		delete(c.requests, id)
+		c.requestMu.Unlock()
+
+		request.responseChan <- err
+		close(request.responseChan)
+
+		return
+	}
+}
+
+func (c *Client) readLoop() {
 	reader := bufio.NewReader(c.conn)
 	for {
 		data, err := reader.ReadBytes('\n')
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				c.Close()
-				return
-			} else {
-				c.publishError(err)
-				continue
-			}
+			c.Close()
+			return
 		}
 
-		response := &ipcResponse{}
-		err = swallowjson.UnmarshalWith(response, "EventData", data)
-		if err != nil {
-			c.publishError(err)
-			continue
-		}
+		var response ipcResponse
+		err = swallowjson.UnmarshalWith(&response, "EventData", data)
+		if err != nil { continue }
 
-		c.dispatch(response)
+		go c.dispatch(response)
 	}
 }
 
-func (c *Client) requestSend(request *ipcRequest) (any, error) {
-	if c.closed {
-		return nil, ErrClosed
-	}
-
-	c.receiver <- request
-	response := <-request.responseChan
-	if response.Error != "success" {
-		return nil, &MpvError{response.Error}
-	}
-
-	return response.Data, nil
-}
-
-func (c *Client) requestInternal(command []any, async bool) (any, error) {
-	request := &ipcRequest{
-		Command:      command,
-		RequestID:    rand.Int(),
-		Async:        async,
-		responseChan: make(chan *ipcResponse),
-	}
-
-	return c.requestSend(request)
-}
-
-func (c *Client) dispatch(response *ipcResponse) {
+func (c *Client) dispatch(response ipcResponse) {
 	switch response.Event {
 	case "":
 		c.requestMu.Lock()
-		defer c.requestMu.Unlock()
 
 		if c.requests == nil {
 			return
 		}
 
-		request, ok := c.requests[response.RequestID]
-		if !ok {
-			return
+		if responseChan, ok := c.requests[response.RequestID]; ok {
+			if response.Error != "success" {
+				responseChan <- error(&IPCError{response.Error})
+			} else {
+				responseChan <- response.Data
+			}
+
+			close(responseChan)
+			delete(c.requests, response.RequestID)
 		}
 
-		request.responseChan <- response
-		close(request.responseChan)
-		delete(c.requests, response.RequestID)
+		c.requestMu.Unlock()
+
 	case "property-change":
-		c.observerMu.Lock()
-		defer c.observerMu.Unlock()
+		c.observerMu.RLock()
 
 		if c.observers == nil {
 			return
 		}
-
 		observer, ok := c.observers[response.ID]
+
+		c.observerMu.RUnlock()
+
 		if ok {
-			go observer(response.Data)
+			observer <- response.Data
 		}
+
 	default:
-		c.listenerMu.Lock()
-		defer c.listenerMu.Unlock()
+		c.listenerMu.RLock()
 
 		if c.listeners == nil {
 			return
 		}
+		listeners, ok := c.listeners[response.Event]
 
-		listener, ok := c.listeners[response.Event]
+		c.listenerMu.RUnlock()
+
 		if ok {
-			go listener(response.EventData)
+			for element := listeners.Front(); element != nil; element = element.Next() {
+				element.Value.(chan<- map[string]any) <- response.EventData
+			}
 		}
-	}
-}
-
-func (c *Client) publishError(err error) {
-	if c.onError != nil {
-		c.onError(err)
 	}
 }
