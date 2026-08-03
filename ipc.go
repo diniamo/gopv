@@ -74,9 +74,12 @@ func (c *Client) Subscribe(event string) (<-chan map[string]any, func(), error) 
 		c.listeners        = make(map[string]*list.List, 1)
 		listeners          = list.New()
 		c.listeners[event] = listeners
-	} else if c.listeners[event] == nil {
-		listeners          = list.New()
-		c.listeners[event] = listeners
+	} else {
+		listeners = c.listeners[event]
+		if listeners == nil {
+			listeners          = list.New()
+			c.listeners[event] = listeners
+		}
 	}
 
 	listener := make(chan map[string]any)
