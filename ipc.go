@@ -2,43 +2,42 @@ package gopv
 
 import (
 	"bufio"
-	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
 	"net"
+	"slices"
 	"sync"
 
 	"go.pennock.tech/swallowjson"
 )
 
-// IPC client
+// IPC client data
 type Client struct {
 	conn        net.Conn
 
 	requestChan chan request
-	requestMu   sync.Mutex
-	requests    map[int64]chan any
+	requests    map[int64]chan<- any
 	requestID   int64
 
-	listenerMu  sync.RWMutex
-	listeners   map[string]*list.List
+	listeners   map[string][]*subscription[map[string]any]
 
-	observerMu  sync.RWMutex
-	observers   map[int64]chan<- any
+	observers   map[int64]*subscription[any]
 	observerID  int64
 
-	close       sync.Once
 	ctx         context.Context
 	cancel      func()
+	close       sync.Once
+	mu          sync.Mutex
+	closed      bool
 }
 
 // Error sent by mpv
 type IPCError struct {
-	status string
+	Status string
 }
-func (e IPCError) Error() string {
-	return e.status
+func (e *IPCError) Error() string {
+	return e.Status
 }
 
 var ErrClosed = errors.New("IPC client is closed")
@@ -46,7 +45,7 @@ var ErrClosed = errors.New("IPC client is closed")
 // Send an IPC request.
 // Errors are also sent through the channel.
 func (c *Client) Request(command ...any) <-chan any {
-	// IMPORTANT: this has to be buffered, so we dispatcher goroutine won't hang, if the user ignores the result
+	// IMPORTANT: this has to be buffered, so the dispatcher goroutine won't hang if the user ignores the result
 	responseChan := make(chan any, 1)
 
 	select {
@@ -63,106 +62,110 @@ func (c *Client) Request(command ...any) <-chan any {
 // The map data sent through the channel may be nil.
 // The returned function can be used to unsubscribe and close the channel.
 func (c *Client) Subscribe(event string) (<-chan map[string]any, func(), error) {
-	if c.ctx.Err() != nil {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
 		return nil, nil, ErrClosed
 	}
 
-	c.listenerMu.Lock()
+	ctx, cancel := context.WithCancel(c.ctx)
+	out := make(chan map[string]any)
+	sub := &subscription[map[string]any]{
+		ctx: ctx,
+		queue: []map[string]any{},
+		out: out,
+		wake: make(chan struct{}, 1),
+	}
+	go sub.pump()
 
-	var listeners *list.List
-	if c.listeners == nil {
-		c.listeners        = make(map[string]*list.List, 1)
-		listeners          = list.New()
-		c.listeners[event] = listeners
+	listeners := c.listeners[event]
+	if listeners == nil {
+		c.listeners[event] = []*subscription[map[string]any]{sub}
 	} else {
-		listeners = c.listeners[event]
-		if listeners == nil {
-			listeners          = list.New()
-			c.listeners[event] = listeners
-		}
+		c.listeners[event] = append(c.listeners[event], sub)
 	}
 
-	listener := make(chan map[string]any)
-	element  := listeners.PushBack(chan<- map[string]any(listener))
+	c.mu.Unlock()
+	return out, func() {
+		c.mu.Lock()
 
-	c.listenerMu.Unlock()
+		listeners := c.listeners[event]
+		for i, s := range listeners {
+			if s == sub {
+				c.listeners[event] = slices.Delete(listeners, i, i + 1)
+				break
+			}
+		}
+		cancel()
 
-	return listener, func() {
-		c.listenerMu.Lock()
-
-		c.listeners[event].Remove(element)
-		close(listener)
-
-		c.listenerMu.Unlock()
+		c.mu.Unlock()
 	}, nil
 }
 
 // Start observing a property.
 // The returned function can be used to stop observing and close the channel.
 func (c *Client) ObserveProperty(property string) (<-chan any, func(), error) {
-	c.observerMu.Lock()
-
-	if c.observers == nil {
-		c.observers = make(map[int64]chan<- any, 1)
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, nil, ErrClosed
 	}
 
 	id := c.observerID
-	observer := make(chan any)
-	c.observers[id] = observer
 	c.observerID += 1
 
-	c.observerMu.Unlock()
+	ctx, cancel := context.WithCancel(c.ctx)
+	out := make(chan any)
+	sub := &subscription[any]{
+		ctx: ctx,
+		queue: []any{},
+		out: out,
+		wake: make(chan struct{}, 1),
+	}
+	c.observers[id] = sub
+	go sub.pump()
 
+	c.mu.Unlock()
 	response := <-c.Request("observe_property", id, property)
 	if err, ok := response.(error); ok {
-		c.observerMu.Lock()
+		close(out)
+		cancel()
 		delete(c.observers, id)
-		c.observerMu.Unlock()
-
 		return nil, nil, err
 	}
 
-	return observer, func() {
-		c.observerMu.Lock()
-
+	return out, func() {
+		c.mu.Lock()
+		cancel()
 		delete(c.observers, id)
-		close(observer)
+		c.mu.Unlock()
 
-		c.observerMu.Unlock()
+		c.Request("unobserve_property", id)
 	}, nil
 }
 
 // Close the client.
 func (c *Client) Close() {
 	c.close.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+
 		c.cancel()
 		c.conn.Close()
 
-		c.requestMu.Lock()
 		for _, ch := range c.requests {
+			ch <- ErrClosed
 			close(ch)
 		}
 		clear(c.requests)
-		c.requestMu.Unlock()
-
-		c.listenerMu.Lock()
-		for _, listeners := range c.listeners {
-			for e := listeners.Front(); e != nil; e = e.Next() {
-				close(e.Value.(chan<- map[string]any))
-			}
-		}
 		clear(c.listeners)
-		c.listenerMu.Unlock()
-
-		c.observerMu.Lock()
-		for _, ch := range c.observers {
-			close(ch)
-		}
 		clear(c.observers)
-		c.observerMu.Unlock()
+
+		c.mu.Unlock()
 	})
 }
 
+// SECTION: internal
 
 type request struct {
 	command      []any
@@ -184,12 +187,23 @@ type ipcResponse struct {
 	ID        int64          `json:"id"`
 }
 
+type subscription[T any] struct {
+	mu    sync.Mutex
+	ctx   context.Context
+	queue []T
+	out   chan<- T
+	wake  chan struct{}
+}
+
 func connectInternal(conn net.Conn) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	client := &Client{
 		conn:        conn,
 		requestChan: make(chan request),
+		requests:    make(map[int64]chan<- any),
+		listeners:   make(map[string][]*subscription[map[string]any]),
+		observers:   make(map[int64]*subscription[any]),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -212,8 +226,6 @@ func (c *Client) writeLoop() {
 }
 
 func (c *Client) sendRequest(request request) {
-	c.requestMu.Lock()
-
 	id := c.requestID
 
 	body, err := json.Marshal(ipcRequest{
@@ -222,30 +234,25 @@ func (c *Client) sendRequest(request request) {
 		Async:     true,
 	})
 	if err != nil {
-		c.requestMu.Unlock()
 		request.responseChan <- err
 		close(request.responseChan)
 		return
 	}
 
-	if c.requests == nil {
-		c.requests = make(map[int64]chan any, 1)
-	}
+	c.mu.Lock()
 	c.requests[id] = request.responseChan
 	c.requestID += 1
-
-	c.requestMu.Unlock()
+	c.mu.Unlock()
 
 	_, err = c.conn.Write(append(body, '\n'))
 	if err != nil {
-		c.requestMu.Lock()
-		delete(c.requests, id)
-		c.requestMu.Unlock()
-
-		request.responseChan <- err
-		close(request.responseChan)
-
-		return
+		c.mu.Lock()
+		if _, ok := c.requests[id]; ok {
+			request.responseChan <- err
+			close(request.responseChan)
+			delete(c.requests, id)
+		}
+		c.mu.Unlock()
 	}
 }
 
@@ -262,19 +269,15 @@ func (c *Client) readLoop() {
 		err = swallowjson.UnmarshalWith(&response, "EventData", data)
 		if err != nil { continue }
 
-		go c.dispatch(response)
+		c.dispatch(response)
 	}
 }
 
 func (c *Client) dispatch(response ipcResponse) {
+	c.mu.Lock()
+
 	switch response.Event {
 	case "":
-		c.requestMu.Lock()
-
-		if c.requests == nil {
-			return
-		}
-
 		if responseChan, ok := c.requests[response.RequestID]; ok {
 			if response.Error != "success" {
 				responseChan <- error(&IPCError{response.Error})
@@ -286,36 +289,62 @@ func (c *Client) dispatch(response ipcResponse) {
 			delete(c.requests, response.RequestID)
 		}
 
-		c.requestMu.Unlock()
-
 	case "property-change":
-		c.observerMu.RLock()
-
-		if c.observers == nil {
-			return
-		}
-		observer, ok := c.observers[response.ID]
-
-		c.observerMu.RUnlock()
-
-		if ok {
-			observer <- response.Data
+		if sub, ok := c.observers[response.ID]; ok {
+			sub.push(response.Data)
 		}
 
 	default:
-		c.listenerMu.RLock()
-
-		if c.listeners == nil {
-			return
-		}
-		listeners, ok := c.listeners[response.Event]
-
-		c.listenerMu.RUnlock()
-
-		if ok {
-			for element := listeners.Front(); element != nil; element = element.Next() {
-				element.Value.(chan<- map[string]any) <- response.EventData
+		if listeners, ok := c.listeners[response.Event]; ok {
+			for _, sub := range listeners {
+				sub.push(response.EventData)
 			}
 		}
 	}
+
+	c.mu.Unlock()
+}
+
+func (s *subscription[T]) pump() {
+	outer: for {
+		select {
+		case <-s.ctx.Done():
+			break outer
+		case <-s.wake:
+		}
+
+		for {
+			s.mu.Lock()
+			if len(s.queue) > 0 {
+				value := s.queue[0]
+
+				var zero T
+				s.queue[0] = zero
+				s.queue = s.queue[1:]
+
+				s.mu.Unlock()
+
+				select {
+				case <-s.ctx.Done():
+					break outer
+				case s.out <- value:
+				}
+			} else {
+				s.mu.Unlock()
+				break
+			}
+		}
+	}
+
+	close(s.out)
+}
+
+func (s *subscription[T]) push(v T) {
+	s.mu.Lock()
+	s.queue = append(s.queue, v)
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+	s.mu.Unlock()
 }
