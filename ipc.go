@@ -20,7 +20,7 @@ type Client struct {
 	requests    map[int64]chan<- any
 	requestID   int64
 
-	listeners   map[string][]*subscription[map[string]any]
+	listeners   map[string][]*subscription[Event]
 
 	observers   map[int64]*subscription[any]
 	observerID  int64
@@ -30,6 +30,11 @@ type Client struct {
 	close       sync.Once
 	mu          sync.Mutex
 	closed      bool
+}
+
+type Event struct {
+	Name string
+	Data map[string]any
 }
 
 // Error sent by mpv
@@ -58,10 +63,11 @@ func (c *Client) Request(command ...any) <-chan any {
 	return responseChan
 }
 
-// Subscribe to an event.
-// The map data sent through the channel may be nil.
+// Subscribe to events.
+// Adding the same event multiple times will result in that event being sent that many times.
+// The Data in the sent Event may be nil.
 // The returned function can be used to unsubscribe and close the channel.
-func (c *Client) Subscribe(event string) (<-chan map[string]any, func(), error) {
+func (c *Client) Subscribe(events ...string) (<-chan Event, func(), error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -69,31 +75,35 @@ func (c *Client) Subscribe(event string) (<-chan map[string]any, func(), error) 
 	}
 
 	ctx, cancel := context.WithCancel(c.ctx)
-	out := make(chan map[string]any)
-	sub := &subscription[map[string]any]{
+	out := make(chan Event)
+	sub := &subscription[Event]{
 		ctx: ctx,
-		queue: []map[string]any{},
+		queue: []Event{},
 		out: out,
 		wake: make(chan struct{}, 1),
 	}
 	go sub.pump()
 
-	listeners := c.listeners[event]
-	if listeners == nil {
-		c.listeners[event] = []*subscription[map[string]any]{sub}
-	} else {
-		c.listeners[event] = append(c.listeners[event], sub)
+	for _, event := range events {
+		listeners := c.listeners[event]
+		if listeners == nil {
+			c.listeners[event] = []*subscription[Event]{sub}
+		} else {
+			c.listeners[event] = append(c.listeners[event], sub)
+		}
 	}
 
 	c.mu.Unlock()
 	return out, func() {
 		c.mu.Lock()
 
-		listeners := c.listeners[event]
-		for i, s := range listeners {
-			if s == sub {
-				c.listeners[event] = slices.Delete(listeners, i, i + 1)
-				break
+		for _, event := range events {
+			listeners := c.listeners[event]
+			for i, s := range listeners {
+				if s == sub {
+					c.listeners[event] = slices.Delete(listeners, i, i + 1)
+					break
+				}
 			}
 		}
 		cancel()
@@ -202,7 +212,7 @@ func connectInternal(conn net.Conn) *Client {
 		conn:        conn,
 		requestChan: make(chan request),
 		requests:    make(map[int64]chan<- any),
-		listeners:   make(map[string][]*subscription[map[string]any]),
+		listeners:   make(map[string][]*subscription[Event]),
 		observers:   make(map[int64]*subscription[any]),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -297,7 +307,7 @@ func (c *Client) dispatch(response ipcResponse) {
 	default:
 		if listeners, ok := c.listeners[response.Event]; ok {
 			for _, sub := range listeners {
-				sub.push(response.EventData)
+				sub.push(Event{response.Event, response.EventData})
 			}
 		}
 	}
